@@ -73,10 +73,24 @@ const BUBBLE_LABEL_MS = 560;
 const SHADOW_SPEED = LIGHTNING_SPEED * 0.42; // below this while moving: illusion; above: shadow
 const MOOD_CROSSFADE_MS = 220;
 
+// The typing keyboard as a second playing surface: each row of keys maps to
+// a row of the stage, each key in it to a column — pressing one is the same
+// gesture as clicking that spot, just addressed by name instead of by hand.
+const KEY_ROWS = ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"];
+const KEY_POSITIONS = new Map<string, Point>();
+KEY_ROWS.forEach((row, rowIndex) => {
+  const y = 0.16 + (rowIndex / (KEY_ROWS.length - 1)) * 0.68;
+  for (let col = 0; col < row.length; col++) {
+    const x = 0.06 + (col / (row.length - 1)) * 0.88;
+    KEY_POSITIONS.set(row[col]!, { x, y });
+  }
+});
+
 const pointer: Point = { x: 0.5, y: 0.42 };
 let lastMoveAt = -Infinity;
 let lastLightningAt = 0;
 let lastPluckAt = -Infinity;
+let lastKeyAt = -Infinity;
 let lastSpeed = 0;
 let presence = 0;
 let lastFrameAt = 0;
@@ -211,6 +225,13 @@ function setPointer(x: number, y: number, now: number): void {
   }
 }
 
+function jumpPointer(x: number, y: number, now: number): void {
+  pointer.x = clamp01(x);
+  pointer.y = clamp01(y);
+  lastMoveAt = now;
+  lastSpeed = 0;
+}
+
 function normalisePointer(event: PointerEvent): Point {
   const rect = stage.getBoundingClientRect();
   return {
@@ -308,6 +329,18 @@ function render(now: number): void {
 
   draw.fillStyle = "rgba(5, 4, 10, 0.16)";
   draw.fillRect(0, 0, width, height);
+
+  // The keyboard grid: a faint constellation showing where each key lands,
+  // fading further out the less recently a key has been used.
+  const keyFade = clamp01(1 - (now - lastKeyAt) / 4000) * 0.35 + 0.05;
+  draw.textAlign = "center";
+  draw.textBaseline = "middle";
+  draw.font = "10px system-ui, sans-serif";
+  draw.fillStyle = `rgba(207, 201, 232, ${keyFade})`;
+  for (const [key, pos] of KEY_POSITIONS) {
+    draw.fillText(key, pos.x * width, pos.y * height);
+  }
+  draw.textBaseline = "alphabetic";
 
   // Dream: slow drifting glow, always present, inviting the first touch.
   const t = now / 1000;
@@ -418,8 +451,19 @@ window.addEventListener("keydown", (event) => {
   if (event.key.startsWith("Arrow")) {
     heldKeys.add(event.key);
     event.preventDefault();
-  } else if (event.key === " " && !event.repeat) {
+    return;
+  }
+  if (event.key === " " && !event.repeat) {
     ensureAudio();
+    pluckBubble();
+    event.preventDefault();
+    return;
+  }
+  const gridPos = event.key.length === 1 ? KEY_POSITIONS.get(event.key.toLowerCase()) : undefined;
+  if (gridPos && !event.repeat) {
+    ensureAudio();
+    lastKeyAt = performance.now();
+    jumpPointer(gridPos.x, gridPos.y, lastKeyAt);
     pluckBubble();
     event.preventDefault();
   }
