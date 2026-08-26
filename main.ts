@@ -40,6 +40,13 @@ interface Flash {
   angle: number;
 }
 
+interface TrailPoint {
+  x: number;
+  y: number;
+  bornAt: number;
+  hue: number;
+}
+
 const MIN_FREQ = 90;
 const MAX_FREQ = 720;
 const MIN_CUTOFF = 250;
@@ -53,6 +60,8 @@ const LIGHTNING_COOLDOWN_MS = 260;
 const BUBBLE_LIFE_MS = 750;
 const FLASH_LIFE_MS = 140;
 const KEY_SPEED = 0.7; // normalised units per second
+const TRAIL_LIFE_MS = 380; // how long a drift smear lingers
+const MAX_TRAIL_POINTS = 48;
 
 // The six as-ifs aren't six toys — they're names for the states the one
 // point signal (position, speed, presence) already passes through. Naming
@@ -100,6 +109,7 @@ let moodSince = 0;
 
 const bubbles: Bubble[] = [];
 const flashes: Flash[] = [];
+const trail: TrailPoint[] = [];
 const heldKeys = new Set<string>();
 
 let audio: AudioGraph | null = null;
@@ -218,6 +228,9 @@ function setPointer(x: number, y: number, now: number): void {
   pointer.y = clamp01(y);
   lastMoveAt = now;
   lastSpeed = speed;
+
+  trail.push({ x: pointer.x, y: pointer.y, bornAt: now, hue: hueFor(pointer.y) });
+  if (trail.length > MAX_TRAIL_POINTS) trail.shift();
 
   if (audio && speed > LIGHTNING_SPEED && now - lastLightningAt > LIGHTNING_COOLDOWN_MS) {
     lastLightningAt = now;
@@ -353,6 +366,23 @@ function render(now: number): void {
     gradient.addColorStop(1, "hsla(250, 70%, 55%, 0)");
     draw.fillStyle = gradient;
     draw.fillRect(0, 0, width, height);
+  }
+
+  // Shadow: a smear left by drifting, each segment fading with its own age.
+  while (trail.length && now - trail[0]!.bornAt > TRAIL_LIFE_MS) trail.shift();
+  draw.lineCap = "round";
+  for (let i = 1; i < trail.length; i++) {
+    const from = trail[i - 1]!;
+    const to = trail[i]!;
+    const age = now - to.bornAt;
+    const alpha = Math.max(0, 1 - age / TRAIL_LIFE_MS) * 0.4;
+    if (alpha <= 0.01) continue;
+    draw.strokeStyle = `hsla(${to.hue}, 80%, 70%, ${alpha})`;
+    draw.lineWidth = 1 + alpha * 14;
+    draw.beginPath();
+    draw.moveTo(from.x * width, from.y * height);
+    draw.lineTo(to.x * width, to.y * height);
+    draw.stroke();
   }
 
   // The point itself: brighter and larger the more it is singing.
