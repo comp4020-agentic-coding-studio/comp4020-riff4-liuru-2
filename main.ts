@@ -24,6 +24,22 @@ interface AudioGraph {
   filter: BiquadFilterNode;
   voiceGain: GainNode;
   noiseBuffer: AudioBuffer;
+  // A sustained-press voice, inspired by (but never labelled as) a six-syllable
+  // chant: one continuous body that thickens and brightens the longer it's
+  // held, reshaped in real time by the same x/y/speed signal as everything
+  // else. See updateChant() for how these blend — never switched, only faded.
+  chantFilter: BiquadFilterNode;
+  oscLow: OscillatorNode;
+  oscLowGain: GainNode;
+  oscMid: OscillatorNode;
+  oscMidGain: GainNode;
+  oscHigh: OscillatorNode;
+  oscHighLevelGain: GainNode;
+  oscHighTremoloGain: GainNode;
+  tremoloLfo: OscillatorNode;
+  tremoloDepthGain: GainNode;
+  noiseFilter: BiquadFilterNode;
+  noiseGain: GainNode;
 }
 
 interface Bubble {
@@ -62,6 +78,34 @@ const FLASH_LIFE_MS = 140;
 const KEY_SPEED = 0.7; // normalised units per second
 const TRAIL_LIFE_MS = 380; // how long a drift smear lingers
 const MAX_TRAIL_POINTS = 48;
+
+// A sustained press slowly opens onto a second, quieter voice under the main
+// one. Time moves it through the arc; gesture (position, speed) reshapes what
+// it sounds like along the way. Below HOLD_THRESHOLD_MS it never engages, so
+// an ordinary tap is untouched.
+const HOLD_THRESHOLD_MS = 200;
+const CHANT_LOW_LEVEL = 0.16;
+const CHANT_LOW_ATTACK_TAU = 0.5;
+const CHANT_MID_LEVEL = 0.09;
+const CHANT_MID_START_S = 1.0;
+const CHANT_MID_RISE_S = 1.4;
+const CHANT_HIGH_LEVEL = 0.06;
+const CHANT_HIGH_START_S = 2.2;
+const CHANT_HIGH_RISE_S = 1.8;
+const CHANT_TREMOLO_START_S = 2.2;
+const CHANT_TREMOLO_FULL_S = 5.0;
+const CHANT_TREMOLO_MIN = 0.05;
+const CHANT_TREMOLO_MAX = 0.35;
+const CHANT_NOISE_LEVEL = 0.05;
+const CHANT_NOISE_RISE_START_S = 3.0;
+const CHANT_NOISE_PEAK_S = 3.8;
+const CHANT_NOISE_FALL_END_S = 5.6;
+const CHANT_RELEASE_TAU = 1.2; // the HUM tail's decay-to-silence
+const CHANT_FADE_TAU = 0.45; // how fast the other layers clear on release
+const CHANT_RELEASE_PITCH_DROP = 0.12; // HUM resolves slightly downward
+const CHANT_AGITATION_SPEED_REF = LIGHTNING_SPEED * 0.6;
+const CHANT_AGITATION_TAU_UP = 0.1;
+const CHANT_AGITATION_TAU_DOWN = 1.2;
 
 // The six as-ifs aren't six toys — they're names for the states the one
 // point signal (position, speed, presence) already passes through. Naming
@@ -107,6 +151,14 @@ let mood: Mood = "dream";
 let prevMood: Mood | null = null;
 let moodSince = 0;
 
+let pointerIsDown = false;
+let pointerDownAt = -Infinity;
+let holdActive = false;
+let holdStartAt = -Infinity;
+let releasing = false;
+let releaseStartAt = -Infinity;
+let holdAgitation = 0;
+
 const bubbles: Bubble[] = [];
 const flashes: Flash[] = [];
 const trail: TrailPoint[] = [];
@@ -116,6 +168,19 @@ let audio: AudioGraph | null = null;
 
 function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
+}
+
+function smoothstep(x: number, edge0: number, edge1: number): number {
+  if (edge0 === edge1) return x < edge0 ? 0 : 1;
+  const t = clamp01((x - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+}
+
+// A rise then a fall — one soft swell, not a repeating hit.
+function bump(x: number, riseStart: number, peak: number, fallEnd: number): number {
+  if (x <= riseStart || x >= fallEnd) return 0;
+  if (x <= peak) return smoothstep(x, riseStart, peak);
+  return 1 - smoothstep(x, peak, fallEnd);
 }
 
 function buildNoiseBuffer(ctx: AudioContext): AudioBuffer {
@@ -159,7 +224,86 @@ function ensureAudio(): AudioGraph {
 
   osc.start();
 
-  audio = { ctx, master, osc, filter, voiceGain, noiseBuffer: buildNoiseBuffer(ctx) };
+  // The hold voice: a shared brightness filter (fed by x, same as the main
+  // voice) that every layer below passes through before reaching the mix.
+  const chantFilter = ctx.createBiquadFilter();
+  chantFilter.type = "lowpass";
+  chantFilter.Q.value = 0.7;
+  chantFilter.connect(master);
+  chantFilter.connect(delay);
+
+  const oscLow = ctx.createOscillator();
+  oscLow.type = "sine";
+  const oscLowGain = ctx.createGain();
+  oscLowGain.gain.value = 0;
+  oscLow.connect(oscLowGain);
+  oscLowGain.connect(chantFilter);
+
+  const oscMid = ctx.createOscillator();
+  oscMid.type = "sine";
+  oscMid.detune.value = 5;
+  const oscMidGain = ctx.createGain();
+  oscMidGain.gain.value = 0;
+  oscMid.connect(oscMidGain);
+  oscMidGain.connect(chantFilter);
+
+  const oscHigh = ctx.createOscillator();
+  oscHigh.type = "sine";
+  const oscHighLevelGain = ctx.createGain();
+  oscHighLevelGain.gain.value = 0;
+  const oscHighTremoloGain = ctx.createGain();
+  oscHighTremoloGain.gain.value = 1;
+  oscHigh.connect(oscHighLevelGain);
+  oscHighLevelGain.connect(oscHighTremoloGain);
+  oscHighTremoloGain.connect(chantFilter);
+
+  const tremoloLfo = ctx.createOscillator();
+  tremoloLfo.type = "sine";
+  tremoloLfo.frequency.value = 5;
+  const tremoloDepthGain = ctx.createGain();
+  tremoloDepthGain.gain.value = 0;
+  tremoloLfo.connect(tremoloDepthGain);
+  tremoloDepthGain.connect(oscHighTremoloGain.gain);
+
+  const noiseBuffer = buildNoiseBuffer(ctx);
+  const noiseSource = ctx.createBufferSource();
+  noiseSource.buffer = noiseBuffer;
+  noiseSource.loop = true;
+  const noiseFilter = ctx.createBiquadFilter();
+  noiseFilter.type = "bandpass";
+  noiseFilter.Q.value = 1.2;
+  const noiseGain = ctx.createGain();
+  noiseGain.gain.value = 0;
+  noiseSource.connect(noiseFilter);
+  noiseFilter.connect(noiseGain);
+  noiseGain.connect(chantFilter);
+
+  oscLow.start();
+  oscMid.start();
+  oscHigh.start();
+  tremoloLfo.start();
+  noiseSource.start();
+
+  audio = {
+    ctx,
+    master,
+    osc,
+    filter,
+    voiceGain,
+    noiseBuffer,
+    chantFilter,
+    oscLow,
+    oscLowGain,
+    oscMid,
+    oscMidGain,
+    oscHigh,
+    oscHighLevelGain,
+    oscHighTremoloGain,
+    tremoloLfo,
+    tremoloDepthGain,
+    noiseFilter,
+    noiseGain,
+  };
   return audio;
 }
 
@@ -279,6 +423,88 @@ function updateAudioParams(): void {
   osc.frequency.setTargetAtTime(currentFrequency(), now, 0.03);
   filter.frequency.setTargetAtTime(MIN_CUTOFF * Math.pow(MAX_CUTOFF / MIN_CUTOFF, pointer.x), now, 0.05);
   voiceGain.gain.setTargetAtTime(presence * BASE_VOICE_LEVEL, now, 0.09);
+}
+
+// TIME determines progression through the arc; GESTURE (position, speed)
+// determines its expression. Every target below is a smooth function of
+// elapsed hold-time and current signal, pushed via setTargetAtTime every
+// frame — so the layers cross-fade continuously rather than switching, and
+// nothing here is ever named on screen.
+function updateChant(now: number, dt: number): void {
+  if (!audio) return;
+  const {
+    ctx,
+    chantFilter,
+    oscLow,
+    oscLowGain,
+    oscMid,
+    oscMidGain,
+    oscHigh,
+    oscHighLevelGain,
+    tremoloDepthGain,
+    noiseFilter,
+    noiseGain,
+  } = audio;
+  const t = ctx.currentTime;
+
+  // A press promotes itself into a held chant only once it outlives a tap.
+  if (pointerIsDown && !holdActive && !releasing && now - pointerDownAt > HOLD_THRESHOLD_MS) {
+    holdActive = true;
+    holdStartAt = now;
+  }
+
+  // Movement reshapes the chant continuously, on top of whatever the arc is
+  // doing — two players holding the same duration still diverge here.
+  const agitationTarget = holdActive ? clamp01(lastSpeed / CHANT_AGITATION_SPEED_REF) : 0;
+  const agitationTau = agitationTarget > holdAgitation ? CHANT_AGITATION_TAU_UP : CHANT_AGITATION_TAU_DOWN;
+  holdAgitation += (agitationTarget - holdAgitation) * (1 - Math.exp(-dt / agitationTau));
+
+  const baseFreq = currentFrequency();
+  const brightness = MIN_CUTOFF * Math.pow(MAX_CUTOFF / MIN_CUTOFF, pointer.x);
+  chantFilter.frequency.setTargetAtTime(Math.min(MAX_CUTOFF, brightness * (1 + holdAgitation * 0.6)), t, 0.08);
+
+  if (holdActive) {
+    const p = (now - holdStartAt) / 1000; // seconds into the held arc
+
+    // OM: the opening body, always the anchor once a hold has begun.
+    oscLow.frequency.setTargetAtTime(baseFreq * 0.5, t, 0.08);
+    oscLowGain.gain.setTargetAtTime(CHANT_LOW_LEVEL, t, CHANT_LOW_ATTACK_TAU);
+
+    // MA: brighter and richer, growing in rather than switching on.
+    oscMid.frequency.setTargetAtTime(baseFreq, t, 0.08);
+    oscMid.detune.setTargetAtTime(5 + holdAgitation * 15, t, 0.3);
+    const midLevel = CHANT_MID_LEVEL * smoothstep(p, CHANT_MID_START_S, CHANT_MID_START_S + CHANT_MID_RISE_S);
+    oscMidGain.gain.setTargetAtTime(midLevel, t, 0.4);
+
+    // NI, then ME: the same high partial, clear at first, its tremolo
+    // deepening it from bell-like into an airy shimmer as the hold continues.
+    oscHigh.frequency.setTargetAtTime(baseFreq * 2.5, t, 0.08);
+    const highLevel = CHANT_HIGH_LEVEL * smoothstep(p, CHANT_HIGH_START_S, CHANT_HIGH_START_S + CHANT_HIGH_RISE_S);
+    oscHighLevelGain.gain.setTargetAtTime(highLevel, t, 0.4);
+    const tremoloDepth =
+      CHANT_TREMOLO_MIN +
+      (CHANT_TREMOLO_MAX - CHANT_TREMOLO_MIN) * smoothstep(p, CHANT_TREMOLO_START_S, CHANT_TREMOLO_FULL_S) +
+      holdAgitation * 0.15;
+    tremoloDepthGain.gain.setTargetAtTime(Math.min(0.5, tremoloDepth), t, 0.5);
+
+    // PAD: one soft resonant swell partway through, not a repeating hit.
+    const padAmount = bump(p, CHANT_NOISE_RISE_START_S, CHANT_NOISE_PEAK_S, CHANT_NOISE_FALL_END_S);
+    noiseGain.gain.setTargetAtTime(CHANT_NOISE_LEVEL * padAmount, t, 0.25);
+    noiseFilter.frequency.setTargetAtTime(baseFreq * 4, t, 0.2);
+    noiseFilter.Q.setTargetAtTime(1.2 + padAmount * 5, t, 0.2);
+  } else if (releasing) {
+    const r = (now - releaseStartAt) / 1000;
+    // HUM: everything else clears quickly; the low voice alone resolves
+    // downward and takes the long way to silence.
+    oscLow.frequency.setTargetAtTime(baseFreq * 0.5 * (1 - Math.min(1, r / 3) * CHANT_RELEASE_PITCH_DROP), t, 0.6);
+    oscLowGain.gain.setTargetAtTime(0, t, CHANT_RELEASE_TAU);
+    oscMidGain.gain.setTargetAtTime(0, t, CHANT_FADE_TAU);
+    oscHighLevelGain.gain.setTargetAtTime(0, t, CHANT_FADE_TAU);
+    noiseGain.gain.setTargetAtTime(0, t, CHANT_FADE_TAU);
+    if (oscLowGain.gain.value < 0.002) releasing = false;
+  } else {
+    oscLowGain.gain.setTargetAtTime(0, t, CHANT_FADE_TAU);
+  }
 }
 
 function computeMood(now: number): Mood {
@@ -456,6 +682,7 @@ function frame(now: number): void {
   updatePresence(dt, now);
   updateMood(now);
   updateAudioParams();
+  updateChant(now, dt);
   render(now);
   requestAnimationFrame(frame);
 }
@@ -466,6 +693,9 @@ stage.addEventListener("pointerdown", (event) => {
   const { x, y } = normalisePointer(event);
   setPointer(x, y, performance.now());
   pluckBubble();
+  pointerIsDown = true;
+  pointerDownAt = performance.now();
+  releasing = false;
 });
 
 stage.addEventListener("pointermove", (event) => {
@@ -475,6 +705,12 @@ stage.addEventListener("pointermove", (event) => {
 
 stage.addEventListener("pointerup", (event) => {
   if (stage.hasPointerCapture(event.pointerId)) stage.releasePointerCapture(event.pointerId);
+  pointerIsDown = false;
+  if (holdActive) {
+    holdActive = false;
+    releasing = true;
+    releaseStartAt = performance.now();
+  }
 });
 
 window.addEventListener("keydown", (event) => {
