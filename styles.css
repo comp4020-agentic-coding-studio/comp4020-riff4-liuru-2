@@ -59,8 +59,27 @@ main {
 .caption {
   max-width: 34rem;
   margin: 0 auto;
-  padding: 1.5rem 1.5rem 3rem;
+  padding: 1.5rem 1.5rem 0.5rem;
   text-align: center;
   font-size: 0.9rem;
   color: #9d96b8;
+}
+
+.legend {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.4rem 1.1rem;
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 0.5rem 1.5rem 2.5rem;
+  font-size: 0.78rem;
+  color: #756e94;
+}
+
+.legend-glyph {
+  color: #cfc9e8;
+  font-weight: 600;
+  margin-right: 0.35rem;
 }

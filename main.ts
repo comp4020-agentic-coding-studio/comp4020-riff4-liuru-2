@@ -54,11 +54,35 @@ const BUBBLE_LIFE_MS = 750;
 const FLASH_LIFE_MS = 140;
 const KEY_SPEED = 0.7; // normalised units per second
 
+// The six as-ifs aren't six toys — they're names for the states the one
+// point signal (position, speed, presence) already passes through. Naming
+// them on screen is the only new thing here; the mechanic underneath is
+// unchanged.
+const MOOD_LABELS = {
+  dream: { glyph: "夢", gloss: "dream" },
+  illusion: { glyph: "幻", gloss: "illusion" },
+  shadow: { glyph: "影", gloss: "shadow" },
+  bubble: { glyph: "泡", gloss: "bubble" },
+  dew: { glyph: "露", gloss: "dew" },
+  lightning: { glyph: "電", gloss: "lightning" },
+} as const;
+type Mood = keyof typeof MOOD_LABELS;
+
+const LIGHTNING_LABEL_MS = 480;
+const BUBBLE_LABEL_MS = 560;
+const SHADOW_SPEED = LIGHTNING_SPEED * 0.42; // below this while moving: illusion; above: shadow
+const MOOD_CROSSFADE_MS = 220;
+
 const pointer: Point = { x: 0.5, y: 0.42 };
 let lastMoveAt = -Infinity;
 let lastLightningAt = 0;
+let lastPluckAt = -Infinity;
+let lastSpeed = 0;
 let presence = 0;
 let lastFrameAt = 0;
+let mood: Mood = "dream";
+let prevMood: Mood | null = null;
+let moodSince = 0;
 
 const bubbles: Bubble[] = [];
 const flashes: Flash[] = [];
@@ -141,6 +165,7 @@ function pluckBubble(): void {
   osc.stop(now + 0.55);
 
   bubbles.push({ x: pointer.x, y: pointer.y, bornAt: performance.now(), hue: hueFor(pointer.y) });
+  lastPluckAt = performance.now();
 }
 
 function lightningCrack(): void {
@@ -178,6 +203,7 @@ function setPointer(x: number, y: number, now: number): void {
   pointer.x = clamp01(x);
   pointer.y = clamp01(y);
   lastMoveAt = now;
+  lastSpeed = speed;
 
   if (audio && speed > LIGHTNING_SPEED && now - lastLightningAt > LIGHTNING_COOLDOWN_MS) {
     lastLightningAt = now;
@@ -219,6 +245,50 @@ function updateAudioParams(): void {
   osc.frequency.setTargetAtTime(currentFrequency(), now, 0.03);
   filter.frequency.setTargetAtTime(MIN_CUTOFF * Math.pow(MAX_CUTOFF / MIN_CUTOFF, pointer.x), now, 0.05);
   voiceGain.gain.setTargetAtTime(presence * BASE_VOICE_LEVEL, now, 0.09);
+}
+
+function computeMood(now: number): Mood {
+  if (now - lastLightningAt < LIGHTNING_LABEL_MS) return "lightning";
+  if (now - lastPluckAt < BUBBLE_LABEL_MS) return "bubble";
+  const moving = now - lastMoveAt < MOVE_WINDOW_MS;
+  if (!moving) return presence > 0.04 ? "dew" : "dream";
+  return lastSpeed > SHADOW_SPEED ? "shadow" : "illusion";
+}
+
+function updateMood(now: number): void {
+  const next = computeMood(now);
+  if (next !== mood) {
+    prevMood = mood;
+    mood = next;
+    moodSince = now;
+  }
+}
+
+function drawMoodLabel(now: number, width: number, height: number): void {
+  const px = pointer.x * width;
+  const py = pointer.y * height;
+  const glowRadius = 24 + presence * 70;
+  const above = py - glowRadius - 34 > 28;
+  const labelY = above ? py - glowRadius - 18 : py + glowRadius + 34;
+  const hue = hueFor(pointer.y);
+
+  const sinceSwap = now - moodSince;
+  const inAlpha = Math.min(1, sinceSwap / MOOD_CROSSFADE_MS);
+
+  const paint = (name: Mood, alpha: number) => {
+    if (alpha <= 0.01) return;
+    const { glyph, gloss } = MOOD_LABELS[name];
+    draw.textAlign = "center";
+    draw.font = "600 30px 'Noto Sans SC', system-ui, sans-serif";
+    draw.fillStyle = `hsla(${hue}, 85%, 88%, ${alpha * 0.92})`;
+    draw.fillText(glyph, px, labelY);
+    draw.font = "11px system-ui, sans-serif";
+    draw.fillStyle = `hsla(${hue}, 40%, 82%, ${alpha * 0.6})`;
+    draw.fillText(gloss, px, labelY + (above ? 16 : -24));
+  };
+
+  paint(mood, inAlpha);
+  if (prevMood && sinceSwap < MOOD_CROSSFADE_MS) paint(prevMood, 1 - inAlpha);
 }
 
 function hueFor(y: number): number {
@@ -312,6 +382,8 @@ function render(now: number): void {
     }
     draw.stroke();
   }
+
+  drawMoodLabel(now, width, height);
 }
 
 function frame(now: number): void {
@@ -319,6 +391,7 @@ function frame(now: number): void {
   lastFrameAt = now;
   updateKeyboardMovement(dt, now);
   updatePresence(dt, now);
+  updateMood(now);
   updateAudioParams();
   render(now);
   requestAnimationFrame(frame);
